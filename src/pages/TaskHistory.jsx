@@ -1,0 +1,223 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import {
+  RefreshCw,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  CheckCheck,
+  Inbox,
+  AlertCircle,
+} from 'lucide-react';
+import { fetchTasks } from '../services/api';
+import { humanizeTaskType } from '../utils/taskTypes';
+import './TaskHistory.css';
+
+const POLL_INTERVAL_MS = 5000;
+const ACTIVE_STATUSES = ['PENDING', 'PROCESSING'];
+
+const StatusBadge = ({ status }) => {
+  const normalized = (status || '').toUpperCase();
+
+  const config = {
+    PENDING: { label: 'Pending', icon: <Clock size={14} />, className: 'pending' },
+    PROCESSING: { label: 'Processing', icon: <Loader2 size={14} className="badge-spinner" />, className: 'processing' },
+    COMPLETED: { label: 'Completed', icon: <CheckCircle2 size={14} />, className: 'completed' },
+    FAILED: { label: 'Failed', icon: <XCircle size={14} />, className: 'failed' },
+  }[normalized] || { label: status || 'Unknown', icon: <AlertCircle size={14} />, className: 'unknown' };
+
+  return (
+    <span className={`status-badge ${config.className}`}>
+      {config.icon}
+      <span>{config.label}</span>
+    </span>
+  );
+};
+
+const formatDateTime = (value) => {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+};
+
+const TaskHistory = () => {
+  const [tasks, setTasks] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [error, setError] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const intervalRef = useRef(null);
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const loadTasks = useCallback(async ({ silent } = {}) => {
+    if (silent) {
+      setIsRefreshing(true);
+    } else {
+      setIsLoading(true);
+    }
+    try {
+      const data = await fetchTasks();
+      setTasks(Array.isArray(data) ? data : []);
+      setError(null);
+    } catch (err) {
+      setError(
+        err.response?.data?.message || err.message || 'Failed to load tasks.'
+      );
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  }, []);
+
+  // Show the success toast passed from the upload form, then clear the
+  // navigation state so a refresh doesn't re-show it.
+  useEffect(() => {
+    if (location.state?.toast) {
+      setToast(location.state.toast);
+      navigate(location.pathname, { replace: true, state: {} });
+    }
+  }, [location, navigate]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(null), 5000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  // Initial load.
+  useEffect(() => {
+    loadTasks();
+  }, [loadTasks]);
+
+  // Polling: only run while at least one task is PENDING or PROCESSING.
+  // Stop the interval once everything is resolved.
+  useEffect(() => {
+    const hasActive = tasks.some((t) =>
+      ACTIVE_STATUSES.includes((t.status || '').toUpperCase())
+    );
+
+    if (hasActive && !intervalRef.current) {
+      intervalRef.current = setInterval(() => {
+        loadTasks({ silent: true });
+      }, POLL_INTERVAL_MS);
+    } else if (!hasActive && intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    };
+  }, [tasks, loadTasks]);
+
+  const hasActiveTasks = tasks.some((t) =>
+    ACTIVE_STATUSES.includes((t.status || '').toUpperCase())
+  );
+
+  return (
+    <div className="task-history">
+      {toast && (
+        <div className="toast toast-success">
+          <CheckCheck size={18} />
+          <span>{toast}</span>
+        </div>
+      )}
+
+      <div className="task-history-header">
+        <div>
+          <h2>Task History</h2>
+          <p>Track the progress of your background data processing tasks.</p>
+        </div>
+        <div className="task-history-actions">
+          {hasActiveTasks && (
+            <span className="live-indicator">
+              <span className="live-dot" />
+              Auto-refreshing
+            </span>
+          )}
+          <button
+            type="button"
+            className="btn btn-secondary"
+            onClick={() => loadTasks({ silent: true })}
+            disabled={isRefreshing}
+          >
+            <RefreshCw size={16} className={isRefreshing ? 'spinner-small' : ''} />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      <div className="task-table-card">
+        {isLoading ? (
+          <div className="task-state">
+            <Loader2 size={32} className="spinner" />
+            <p>Loading tasks...</p>
+          </div>
+        ) : error ? (
+          <div className="task-state">
+            <AlertCircle size={32} className="state-icon-error" />
+            <p>{error}</p>
+            <button type="button" className="btn btn-secondary" onClick={() => loadTasks()}>
+              <RefreshCw size={16} />
+              Try Again
+            </button>
+          </div>
+        ) : tasks.length === 0 ? (
+          <div className="task-state">
+            <Inbox size={32} className="state-icon-muted" />
+            <p>No tasks yet. Submitted uploads will appear here.</p>
+          </div>
+        ) : (
+          <div className="task-table-wrapper">
+            <table className="task-table">
+              <thead>
+                <tr>
+                  <th>Task Type</th>
+                  <th>Status</th>
+                  <th>Submitted At</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tasks.map((task) => {
+                  const status = (task.status || '').toUpperCase();
+                  const detail =
+                    status === 'FAILED'
+                      ? task.error_message || task.message
+                      : task.message;
+                  return (
+                    <tr key={task.id}>
+                      <td className="cell-type">{humanizeTaskType(task.task_type)}</td>
+                      <td>
+                        <StatusBadge status={task.status} />
+                      </td>
+                      <td className="cell-date">{formatDateTime(task.created_at)}</td>
+                      <td className={`cell-detail ${status === 'FAILED' ? 'is-error' : ''}`}>
+                        {detail || '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default TaskHistory;
