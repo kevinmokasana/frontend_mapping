@@ -9,8 +9,10 @@ import {
   CheckCheck,
   Inbox,
   AlertCircle,
+  Download,
+  FileText,
 } from 'lucide-react';
-import { fetchTasks } from '../services/api';
+import { fetchTasks, fetchChannels, getDownloadUrl } from '../services/api';
 import { humanizeTaskType } from '../utils/taskTypes';
 import './TaskHistory.css';
 
@@ -24,6 +26,11 @@ const StatusBadge = ({ status }) => {
     PENDING: { label: 'Pending', icon: <Clock size={14} />, className: 'pending' },
     PROCESSING: { label: 'Processing', icon: <Loader2 size={14} className="badge-spinner" />, className: 'processing' },
     COMPLETED: { label: 'Completed', icon: <CheckCircle2 size={14} />, className: 'completed' },
+    COMPLETED_WITH_ERRORS: {
+      label: 'Completed with errors',
+      icon: <AlertCircle size={14} />,
+      className: 'completed-with-error',
+    },
     FAILED: { label: 'Failed', icon: <XCircle size={14} />, className: 'failed' },
   }[normalized] || { label: status || 'Unknown', icon: <AlertCircle size={14} />, className: 'unknown' };
 
@@ -32,6 +39,37 @@ const StatusBadge = ({ status }) => {
       {config.icon}
       <span>{config.label}</span>
     </span>
+  );
+};
+
+// Pull a clean, human-friendly file name out of whatever the backend sends.
+// Falls back to the basename of the uploaded S3 key.
+const getFileName = (task) => {
+  const raw =
+    task.file_name ||
+    task.original_filename ||
+    task.filename ||
+    task.input_s3_key ||
+    '';
+  if (!raw) return '—';
+  const base = raw.split('/').pop();
+  // S3 keys often carry a numeric/uuid prefix like "1700000-products.xlsx".
+  return base.replace(/^\d{6,}[-_]/, '') || base;
+};
+
+// The S3 key (or direct URL) of the generated error report, if the task
+// produced one. Tries the common field names the backend might use. For tasks
+// that finished as COMPLETED_WITH_ERRORS, the report lives in `result_s3_key`.
+const getErrorFileRef = (task) => {
+  const status = (task.status || '').toUpperCase();
+  return (
+    task.error_file_url ||
+    task.error_file_key ||
+    task.error_s3_key ||
+    task.error_report_s3_key ||
+    task.error_report_key ||
+    (status === 'COMPLETED_WITH_ERRORS' ? task.result_s3_key : null) ||
+    null
   );
 };
 
@@ -54,10 +92,60 @@ const TaskHistory = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState(null);
   const [toast, setToast] = useState(null);
+  const [channelMap, setChannelMap] = useState({});
+  const [downloadingId, setDownloadingId] = useState(null);
 
   const intervalRef = useRef(null);
   const location = useLocation();
   const navigate = useNavigate();
+
+  // Build an id -> name lookup so we can show the channel name even when the
+  // task payload only carries the channel_id.
+  useEffect(() => {
+    fetchChannels()
+      .then((channels) => {
+        if (!Array.isArray(channels)) return;
+        const map = {};
+        channels.forEach((c) => {
+          map[c.channel_id] = c.channel_name;
+        });
+        setChannelMap(map);
+      })
+      .catch(() => {
+        /* non-critical: fall back to the raw channel_id */
+      });
+  }, []);
+
+  const getChannelName = useCallback(
+    (task) =>
+      task.channel_name || channelMap[task.channel_id] || task.channel_id || '—',
+    [channelMap]
+  );
+
+  // Resolve the error report reference to a real URL and trigger a download.
+  const handleDownloadError = useCallback(async (task) => {
+    const ref = getErrorFileRef(task);
+    if (!ref) return;
+    setDownloadingId(task.id);
+    try {
+      // A full URL can be used directly; a bare S3 key needs a presigned URL.
+      const url = /^https?:\/\//i.test(ref)
+        ? ref
+        : (await getDownloadUrl(ref)).url;
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', '');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (err) {
+      setToast(
+        err.response?.data?.message || 'Could not download the error file.'
+      );
+    } finally {
+      setDownloadingId(null);
+    }
+  }, []);
 
   const loadTasks = useCallback(async ({ silent } = {}) => {
     if (silent) {
@@ -185,28 +273,68 @@ const TaskHistory = () => {
             <table className="task-table">
               <thead>
                 <tr>
+                  <th className="col-id">ID</th>
                   <th>Task Type</th>
+                  <th>File Name</th>
                   <th>Status</th>
+                  <th>Channel</th>
+                  <th>Tenant ID</th>
                   <th>Submitted At</th>
                   <th>Details</th>
+                  <th className="col-error">Error File</th>
                 </tr>
               </thead>
               <tbody>
                 {tasks.map((task) => {
                   const status = (task.status || '').toUpperCase();
-                  const detail =
-                    status === 'FAILED'
-                      ? task.error_message || task.message
-                      : task.message;
+                  const errorRef = getErrorFileRef(task);
+                  const fileName = getFileName(task);
+                  const hasError =
+                    status === 'FAILED' || status === 'COMPLETED_WITH_ERRORS';
+                  const detail = hasError
+                    ? task.error_message || task.message
+                    : task.message;
                   return (
                     <tr key={task.id}>
+                      <td className="cell-id">{task.id ?? task.task_id ?? '—'}</td>
                       <td className="cell-type">{humanizeTaskType(task.task_type)}</td>
+                      <td className="cell-file" title={fileName}>
+                        <FileText size={13} className="cell-file-icon" />
+                        <span className="cell-file-name">{fileName}</span>
+                      </td>
                       <td>
                         <StatusBadge status={task.status} />
                       </td>
+                      <td className="cell-muted">{getChannelName(task)}</td>
+                      <td className="cell-muted">{task.tenant_id || '—'}</td>
                       <td className="cell-date">{formatDateTime(task.created_at)}</td>
-                      <td className={`cell-detail ${status === 'FAILED' ? 'is-error' : ''}`}>
+                      <td
+                        className={`cell-detail ${hasError ? 'is-error' : ''}`}
+                        title={detail || ''}
+                      >
                         {detail || '—'}
+                      </td>
+                      <td className="col-error">
+                        {errorRef ? (
+                          <button
+                            type="button"
+                            className="btn-download"
+                            onClick={() => handleDownloadError(task)}
+                            disabled={downloadingId === task.id}
+                            title="Download error file"
+                          >
+                            {downloadingId === task.id ? (
+                              <Loader2 size={15} className="spinner-small" />
+                            ) : (
+                              <Download size={15} />
+                            )}
+                            <span>Error file</span>
+                          </button>
+                        ) : hasError ? (
+                          <span className="no-error-file">No file</span>
+                        ) : (
+                          <span className="no-error-file">—</span>
+                        )}
                       </td>
                     </tr>
                   );

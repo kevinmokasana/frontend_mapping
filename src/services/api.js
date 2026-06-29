@@ -64,3 +64,11 @@ export const fetchTasks = async () => {
   const response = await api.get('/tasks');
   return response.data;
 };
+
+// Ask the backend for a presigned GET URL to download a stored object
+// (e.g. the generated error report for a failed task) by its S3 key.
+export const getDownloadUrl = async (key) => {
+  const response = await api.get('/download-url', { params: { key } });
+  // Expected: { url: "https://bucket.s3...?X-Amz-..." }
+  return response.data;
+};
